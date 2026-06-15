@@ -24,6 +24,7 @@ fn client_management_handle(
     RemoteControlHandle {
         policy: RemoteControlPolicy::Allowed,
         desired_state_tx: Arc::new(desired_state_tx),
+        reconnect_tx: Arc::new(watch::channel(0).0),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
         desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
         status_tx: Arc::new(status_tx),

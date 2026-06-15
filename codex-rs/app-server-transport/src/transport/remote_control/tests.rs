@@ -188,6 +188,7 @@ async fn plain_start_resolves_persisted_remote_control_preference() {
         },
         CancellationToken::new(),
         desired_state_tx.clone(),
+        watch::channel(0).1,
     );
 
     for (name, stored_preference) in cases {
@@ -405,6 +406,7 @@ fn remote_control_handle_with_current_enrollment(
     RemoteControlHandle {
         policy: RemoteControlPolicy::Allowed,
         desired_state_tx: Arc::new(desired_state_tx),
+        reconnect_tx: Arc::new(watch::channel(0).0),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
         desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
         status_tx: Arc::new(status_tx),
@@ -1242,10 +1244,46 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
         Some("env_test"),
     )
     .await;
-    second_websocket
+
+    assert_eq!(
+        remote_handle
+            .enable(Some("rpc-client"))
+            .await
+            .expect("enable should succeed"),
+        RemoteControlStatusChangedNotification {
+            status: RemoteControlConnectionStatus::Connecting,
+            server_name: test_server_name(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            environment_id: Some("env_test".to_string()),
+        }
+    );
+    expect_remote_control_status_snapshot(
+        &mut status_rx,
+        RemoteControlStatusChangedNotification {
+            status: RemoteControlConnectionStatus::Connecting,
+            server_name: test_server_name(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
+            environment_id: Some("env_test".to_string()),
+        },
+    )
+    .await;
+    let mut third_websocket = timeout(
+        Duration::from_secs(1),
+        accept_remote_control_connection(&listener),
+    )
+    .await
+    .expect("re-enabling connected remote control should reconnect");
+    expect_remote_control_status(
+        &mut status_rx,
+        /*expected_status*/ None,
+        Some("env_test"),
+    )
+    .await;
+    let _ = second_websocket.close(None).await;
+    third_websocket
         .close(None)
         .await
-        .expect("second websocket should close");
+        .expect("third websocket should close");
 
     shutdown_token.cancel();
     let _ = remote_task.await;

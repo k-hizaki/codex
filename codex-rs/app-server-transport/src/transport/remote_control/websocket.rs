@@ -271,6 +271,7 @@ pub(crate) struct RemoteControlWebsocket {
     used_rx: watch::Receiver<usize>,
     desired_state_tx: Arc<watch::Sender<RemoteControlDesiredState>>,
     desired_state_rx: watch::Receiver<RemoteControlDesiredState>,
+    reconnect_rx: watch::Receiver<u64>,
     desired_state_persistence_lock: Arc<Semaphore>,
 }
 
@@ -298,11 +299,12 @@ enum ConnectOutcome {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionEndReason {
     Shutdown,
     Disabled,
     EnabledWatchClosed,
+    ReconnectRequested,
     ConnectionWorkerStopped,
 }
 
@@ -405,6 +407,7 @@ impl RemoteControlWebsocket {
         channels: RemoteControlChannels,
         shutdown_token: CancellationToken,
         desired_state_tx: Arc<watch::Sender<RemoteControlDesiredState>>,
+        reconnect_rx: watch::Receiver<u64>,
     ) -> Self {
         let shutdown_token = shutdown_token.child_token();
         let (server_event_tx, server_event_rx) = mpsc::channel(super::CHANNEL_CAPACITY);
@@ -444,6 +447,7 @@ impl RemoteControlWebsocket {
             used_rx,
             desired_state_tx,
             desired_state_rx,
+            reconnect_rx,
             desired_state_persistence_lock: channels.desired_state_persistence_lock,
         }
     }
@@ -830,7 +834,7 @@ impl RemoteControlWebsocket {
     }
 
     async fn run_connection(
-        &self,
+        &mut self,
         websocket_connection: WebSocketStream<MaybeTlsStream<TcpStream>>,
         shutdown_token: CancellationToken,
     ) -> ConnectionEndReason {
@@ -854,19 +858,31 @@ impl RemoteControlWebsocket {
         ));
 
         let mut desired_state_rx = self.desired_state_rx.clone();
+        let status_publisher = self.status_publisher.clone();
         let connection_end_reason = tokio::select! {
             _ = shutdown_token.cancelled() => ConnectionEndReason::Shutdown,
             changed = desired_state_rx.wait_for(|state| !state.is_enabled()) => {
                 if changed.is_ok() {
-                    self.status_publisher
-                        .publish_status(RemoteControlConnectionStatus::Disabled);
+                    status_publisher.publish_status(RemoteControlConnectionStatus::Disabled);
                     ConnectionEndReason::Disabled
                 } else {
                     ConnectionEndReason::EnabledWatchClosed
                 }
             }
+            changed = self.reconnect_rx.changed() => {
+                if changed.is_ok() {
+                    ConnectionEndReason::ReconnectRequested
+                } else {
+                    ConnectionEndReason::ConnectionWorkerStopped
+                }
+            }
             _ = join_set.join_next() => ConnectionEndReason::ConnectionWorkerStopped,
         };
+        if connection_end_reason != ConnectionEndReason::ReconnectRequested
+            && self.reconnect_rx.has_changed().unwrap_or(false)
+        {
+            let _ = *self.reconnect_rx.borrow_and_update();
+        }
         shutdown_token.cancel();
 
         Self::join_connection_workers(&mut join_set, REMOTE_CONTROL_CONNECTION_SHUTDOWN_TIMEOUT)
@@ -2524,6 +2540,7 @@ mod tests {
                     },
                     shutdown_token,
                     Arc::new(desired_state_tx),
+                    watch::channel(0).1,
                 )
                 .run(/*app_server_client_name_rx*/ None)
                 .await

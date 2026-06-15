@@ -105,6 +105,7 @@ pub(super) struct QueuedServerEnvelope {
 pub struct RemoteControlHandle {
     policy: RemoteControlPolicy,
     desired_state_tx: Arc<watch::Sender<RemoteControlDesiredState>>,
+    reconnect_tx: Arc<watch::Sender<u64>>,
     desired_state_rpc_lock: Arc<Semaphore>,
     desired_state_persistence_lock: Arc<Semaphore>,
     status_tx: Arc<watch::Sender<RemoteControlStatusChangedNotification>>,
@@ -294,14 +295,16 @@ impl RemoteControlHandle {
             server_name = %status.server_name,
             "remote control enable requested"
         );
-        if matches!(
-            status.status,
-            RemoteControlConnectionStatus::Connected | RemoteControlConnectionStatus::Connecting
-        ) {
+        if status.status == RemoteControlConnectionStatus::Connecting {
             return Ok(status);
         }
 
-        Ok(self.publish_status(RemoteControlConnectionStatus::Connecting))
+        let next_status = self.publish_status(RemoteControlConnectionStatus::Connecting);
+        if status.status == RemoteControlConnectionStatus::Connected {
+            let reconnect_generation = (*self.reconnect_tx.borrow()).saturating_add(1);
+            let _ = self.reconnect_tx.send(reconnect_generation);
+        }
+        Ok(next_status)
     }
 
     pub async fn disable(
@@ -952,6 +955,7 @@ pub async fn start_remote_control(
 
     let (desired_state_tx, _desired_state_rx) = watch::channel(desired_state);
     let desired_state_tx = Arc::new(desired_state_tx);
+    let (reconnect_tx, reconnect_rx) = watch::channel(0);
     let desired_state_rpc_lock = Arc::new(Semaphore::new(1));
     let desired_state_persistence_lock = Arc::new(Semaphore::new(1));
     let websocket_desired_state_tx = desired_state_tx.clone();
@@ -1017,6 +1021,7 @@ pub async fn start_remote_control(
             },
             shutdown_token,
             websocket_desired_state_tx,
+            reconnect_rx,
         )
         .run(app_server_client_name_rx);
         match AssertUnwindSafe(websocket_task).catch_unwind().await {
@@ -1057,6 +1062,7 @@ pub async fn start_remote_control(
         RemoteControlHandle {
             policy,
             desired_state_tx,
+            reconnect_tx: Arc::new(reconnect_tx),
             desired_state_rpc_lock,
             desired_state_persistence_lock,
             status_tx: Arc::new(status_tx),
