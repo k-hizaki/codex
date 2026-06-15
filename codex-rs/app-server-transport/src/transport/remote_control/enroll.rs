@@ -211,6 +211,22 @@ impl RemoteControlEnrollment {
             })
     }
 
+    pub(super) fn server_token_refresh_delay(&self) -> std::time::Duration {
+        if self.remote_control_token.is_none() {
+            return std::time::Duration::ZERO;
+        }
+        let Some(expires_at) = self.expires_at else {
+            return std::time::Duration::ZERO;
+        };
+        let refresh_at = expires_at
+            .unix_timestamp()
+            .saturating_sub(REMOTE_CONTROL_SERVER_TOKEN_REFRESH_SKEW_SECS);
+        let delay_secs = refresh_at
+            .saturating_sub(OffsetDateTime::now_utc().unix_timestamp())
+            .max(0);
+        std::time::Duration::from_secs(delay_secs as u64)
+    }
+
     pub(super) fn clear_server_token(&mut self) {
         self.remote_control_token = None;
         self.expires_at = None;
@@ -591,13 +607,20 @@ mod tests {
             expires_at: Some(OffsetDateTime::now_utc() + time::Duration::seconds(29)),
         };
         let expires_later = RemoteControlEnrollment {
-            expires_at: Some(OffsetDateTime::now_utc() + time::Duration::seconds(31)),
+            expires_at: Some(OffsetDateTime::now_utc() + time::Duration::seconds(35)),
             remote_control_token: Some("expires-later".to_string()),
             ..expires_soon.clone()
         };
 
         assert!(expires_soon.should_refresh_server_token());
         assert!(!expires_later.should_refresh_server_token());
+        assert_eq!(
+            expires_soon.server_token_refresh_delay(),
+            std::time::Duration::ZERO
+        );
+        let refresh_delay = expires_later.server_token_refresh_delay();
+        assert!(refresh_delay > std::time::Duration::ZERO);
+        assert!(refresh_delay <= std::time::Duration::from_secs(5));
     }
 
     #[test]

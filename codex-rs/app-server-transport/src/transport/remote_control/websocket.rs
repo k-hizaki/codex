@@ -293,7 +293,10 @@ struct RemoteControlEnrollmentAuthContext<'a, 'b> {
 }
 
 enum ConnectOutcome {
-    Connected(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+    Connected {
+        websocket_connection: Box<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+        server_token_refresh_delay: std::time::Duration,
+    },
     Disabled,
     Shutdown,
 }
@@ -303,6 +306,7 @@ enum ConnectionEndReason {
     Shutdown,
     Disabled,
     EnabledWatchClosed,
+    ServerTokenRefreshDue,
     ConnectionWorkerStopped,
 }
 
@@ -517,11 +521,14 @@ impl RemoteControlWebsocket {
                 "starting app-server remote control websocket connection cycle"
             );
             let shutdown_token = self.shutdown_token.child_token();
-            let websocket_connection = match self
+            let (websocket_connection, server_token_refresh_delay) = match self
                 .connect(&shutdown_token, app_server_client_name.as_deref())
                 .await
             {
-                ConnectOutcome::Connected(websocket_connection) => *websocket_connection,
+                ConnectOutcome::Connected {
+                    websocket_connection,
+                    server_token_refresh_delay,
+                } => (*websocket_connection, server_token_refresh_delay),
                 ConnectOutcome::Disabled => {
                     self.status_publisher
                         .publish_status(RemoteControlConnectionStatus::Disabled);
@@ -531,7 +538,11 @@ impl RemoteControlWebsocket {
             };
 
             let connection_end_reason = self
-                .run_connection(websocket_connection, shutdown_token)
+                .run_connection(
+                    websocket_connection,
+                    server_token_refresh_delay,
+                    shutdown_token,
+                )
                 .await;
             let status = self.status_publisher.status();
             info!(
@@ -749,7 +760,7 @@ impl RemoteControlWebsocket {
             };
 
             match connect_result {
-                Ok((websocket_connection, response)) => {
+                Ok((websocket_connection, response, server_token_refresh_delay)) => {
                     if !self.desired_state_rx.borrow().is_enabled() {
                         return ConnectOutcome::Disabled;
                     }
@@ -765,10 +776,14 @@ impl RemoteControlWebsocket {
                         server_id = ?enrollment.as_ref().map(|enrollment| enrollment.server_id.as_str()),
                         environment_id = ?enrollment.as_ref().map(|enrollment| enrollment.environment_id.as_str()),
                         subscribe_cursor_present = subscribe_cursor.is_some(),
+                        server_token_refresh_delay = ?server_token_refresh_delay,
                         response_headers = %format_headers(response.headers()),
                         "connected to app-server remote control websocket"
                     );
-                    return ConnectOutcome::Connected(Box::new(websocket_connection));
+                    return ConnectOutcome::Connected {
+                        websocket_connection: Box::new(websocket_connection),
+                        server_token_refresh_delay,
+                    };
                 }
                 Err(err) => {
                     if !self.desired_state_rx.borrow().is_enabled() {
@@ -832,6 +847,7 @@ impl RemoteControlWebsocket {
     async fn run_connection(
         &self,
         websocket_connection: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        server_token_refresh_delay: std::time::Duration,
         shutdown_token: CancellationToken,
     ) -> ConnectionEndReason {
         let (websocket_writer, websocket_reader) = websocket_connection.split();
@@ -854,6 +870,8 @@ impl RemoteControlWebsocket {
         ));
 
         let mut desired_state_rx = self.desired_state_rx.clone();
+        let server_token_refresh = tokio::time::sleep(server_token_refresh_delay);
+        tokio::pin!(server_token_refresh);
         let connection_end_reason = tokio::select! {
             _ = shutdown_token.cancelled() => ConnectionEndReason::Shutdown,
             changed = desired_state_rx.wait_for(|state| !state.is_enabled()) => {
@@ -865,6 +883,7 @@ impl RemoteControlWebsocket {
                     ConnectionEndReason::EnabledWatchClosed
                 }
             }
+            _ = &mut server_token_refresh => ConnectionEndReason::ServerTokenRefreshDue,
             _ = join_set.join_next() => ConnectionEndReason::ConnectionWorkerStopped,
         };
         shutdown_token.cancel();
@@ -1321,6 +1340,7 @@ pub(super) async fn connect_remote_control_websocket(
 ) -> io::Result<(
     WebSocketStream<MaybeTlsStream<TcpStream>>,
     tungstenite::http::Response<()>,
+    std::time::Duration,
 )> {
     ensure_rustls_crypto_provider();
 
@@ -1346,6 +1366,7 @@ pub(super) async fn connect_remote_control_websocket(
         connect_options.installation_id,
         connect_options.subscribe_cursor,
     )?;
+    let server_token_refresh_delay = enrollment.server_token_refresh_delay();
 
     let websocket_connect_result = tokio::time::timeout(
         REMOTE_CONTROL_WEBSOCKET_CONNECT_TIMEOUT,
@@ -1363,7 +1384,11 @@ pub(super) async fn connect_remote_control_websocket(
     })?;
 
     match websocket_connect_result {
-        Ok((websocket_stream, response)) => Ok((websocket_stream, response.map(|_| ()))),
+        Ok((websocket_stream, response)) => Ok((
+            websocket_stream,
+            response.map(|_| ()),
+            server_token_refresh_delay,
+        )),
         Err(err) => {
             match &err {
                 tungstenite::Error::Http(response)
