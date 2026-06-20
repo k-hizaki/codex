@@ -117,6 +117,38 @@ async fn initialize_codex_backend_does_not_override_originator() -> Result<()> {
 }
 
 #[tokio::test]
+async fn initialize_chatgpt_remote_clients_do_not_override_originator() -> Result<()> {
+    for client_name in ["codex_chatgpt_android_remote", "codex_chatgpt_ios_remote"] {
+        let responses = Vec::new();
+        let server = create_mock_responses_server_sequence_unchecked(responses).await;
+        let codex_home = TempDir::new()?;
+        create_config_toml(codex_home.path(), &server.uri(), "never")?;
+        let mut mcp = TestAppServer::new(codex_home.path()).await?;
+
+        let message = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.initialize_with_client_info(ClientInfo {
+                name: client_name.to_string(),
+                title: None,
+                version: "1.2026.160".to_string(),
+            }),
+        )
+        .await??;
+
+        let JSONRPCMessage::Response(response) = message else {
+            anyhow::bail!("expected initialize response, got {message:?}");
+        };
+        let InitializeResponse { user_agent, .. } = to_response::<InitializeResponse>(response)?;
+
+        assert!(
+            user_agent.starts_with("codex_cli_rs/"),
+            "{client_name} should not become the app-server originator; got {user_agent}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn initialize_respects_originator_override_env_var() -> Result<()> {
     let responses = Vec::new();
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
