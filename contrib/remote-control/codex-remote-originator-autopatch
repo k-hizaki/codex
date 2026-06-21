@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_SOURCE="${CODEX_AUTOPATCH_REPO_SOURCE:-$HOME/code/openai-codex-latest}"
+WORKTREE="${CODEX_AUTOPATCH_WORKTREE:-$CODEX_HOME/automation/openai-codex-worktree}"
+STATE_DIR="${CODEX_AUTOPATCH_STATE_DIR:-$CODEX_HOME/automation/remote-originator-autopatch}"
+STATE_FILE="$STATE_DIR/state.env"
+LOG_FILE="$STATE_DIR/autopatch.log"
+LOCK_FILE="$STATE_DIR/run.lock"
+REMOTE_URL="${CODEX_AUTOPATCH_REMOTE_URL:-https://github.com/openai/codex.git}"
+TARGET="${CODEX_AUTOPATCH_TARGET:-x86_64-unknown-linux-gnu}"
+CARGO_PROFILE="${CODEX_AUTOPATCH_CARGO_PROFILE:-dev-small}"
+RELEASES_DIR="${CODEX_AUTOPATCH_RELEASES_DIR:-$CODEX_HOME/packages/standalone/releases}"
+CURRENT_LINK="${CODEX_AUTOPATCH_CURRENT_LINK:-$CODEX_HOME/packages/standalone/current}"
+CONTROL_SOCKET="$CODEX_HOME/app-server-control/app-server-control.sock"
+REMOTE_CONTROL_SERVICE="${CODEX_AUTOPATCH_REMOTE_CONTROL_SERVICE:-codex-remote-control.service}"
+STABLE_TAG_PATTERN='^rust-v([0-9]+)\.([0-9]+)\.([0-9]+)$'
+
+if [[ -f "$SCRIPT_DIR/remote-originator.patch" ]]; then
+  PATCH_FILE="${CODEX_AUTOPATCH_PATCH_FILE:-$SCRIPT_DIR/remote-originator.patch}"
+else
+  PATCH_FILE="${CODEX_AUTOPATCH_PATCH_FILE:-$STATE_DIR/remote-originator.patch}"
+fi
+
+mkdir -p "$STATE_DIR" "$(dirname "$WORKTREE")"
+exec > >(tee -a "$LOG_FILE") 2>&1
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "[$(date -Is)] another autopatch run is already active"
+  exit 0
+fi
+
+log() {
+  echo "[$(date -Is)] $*"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+require_file() {
+  [[ -f "$1" ]] || die "missing required file: $1"
+}
+
+latest_stable_tag() {
+  git ls-remote --tags --refs "$REMOTE_URL" 'refs/tags/rust-v*' \
+    | python3 -c '
+import re
+import sys
+
+pattern = re.compile(r"^.*\trefs/tags/(rust-v(\d+)\.(\d+)\.(\d+))$")
+matches = []
+for line in sys.stdin:
+    m = pattern.match(line.strip())
+    if m:
+        matches.append(((int(m.group(2)), int(m.group(3)), int(m.group(4))), m.group(1)))
+if not matches:
+    raise SystemExit("no stable rust-vX.Y.Z tags found")
+print(max(matches)[1])
+'
+}
+
+base_version_from_tag() {
+  local tag="$1"
+  [[ "$tag" =~ $STABLE_TAG_PATTERN ]] || die "unexpected stable tag format: $tag"
+  printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+}
+
+load_state() {
+  installed_tag=""
+  installed_commit=""
+  installed_mode=""
+  installed_version=""
+  installed_package=""
+  installed_at=""
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+}
+
+write_state() {
+  local tag="$1"
+  local commit="$2"
+  local mode="$3"
+  local version="$4"
+  local package_dir="$5"
+  local tmp="$STATE_FILE.tmp"
+  {
+    printf 'installed_tag=%q\n' "$tag"
+    printf 'installed_commit=%q\n' "$commit"
+    printf 'installed_mode=%q\n' "$mode"
+    printf 'installed_version=%q\n' "$version"
+    printf 'installed_package=%q\n' "$package_dir"
+    printf 'installed_at=%q\n' "$(date -Is)"
+  } > "$tmp"
+  mv -f "$tmp" "$STATE_FILE"
+}
+
+fetch_release_metadata() {
+  git -C "$REPO_SOURCE" fetch --quiet "$REMOTE_URL" '+refs/tags/rust-v*:refs/tags/rust-v*'
+}
+
+ensure_worktree() {
+  local ref="$1"
+  if [[ -e "$WORKTREE/.git" ]]; then
+    return
+  fi
+  if [[ -e "$WORKTREE" ]]; then
+    die "worktree path exists but is not a git worktree: $WORKTREE"
+  fi
+  git -C "$REPO_SOURCE" worktree add --detach "$WORKTREE" "$ref"
+}
+
+checkout_release() {
+  local tag="$1"
+  ensure_worktree "$tag"
+  git -C "$WORKTREE" fetch --quiet "$REMOTE_URL" '+refs/tags/rust-v*:refs/tags/rust-v*'
+  git -C "$WORKTREE" checkout --detach "$tag"
+  git -C "$WORKTREE" reset --hard "$tag"
+  git -C "$WORKTREE" clean -fd
+}
+
+upstream_has_fix() {
+  local file="$WORKTREE/codex-rs/app-server/src/request_processors/initialize_processor.rs"
+  grep -q '"codex_chatgpt_android_remote"' "$file" \
+    && grep -q '"codex_chatgpt_ios_remote"' "$file"
+}
+
+set_workspace_version() {
+  local version="$1"
+  (
+    cd "$WORKTREE"
+    VERSION="$version" perl -0pi -e 's/(\[workspace\.package\]\s*version\s*=\s*")[^"]+(")/$1$ENV{VERSION}$2/s' codex-rs/Cargo.toml
+  )
+}
+
+build_package() {
+  local version="$1"
+  local package_dir="$2"
+  local rg_bin="$CURRENT_LINK/codex-path/rg"
+  local bwrap_bin="$CURRENT_LINK/codex-resources/bwrap"
+
+  [[ -x "$rg_bin" ]] || die "missing rg binary at $rg_bin"
+  [[ -x "$bwrap_bin" ]] || die "missing bwrap binary at $bwrap_bin"
+
+  log "building package version=$version target=$TARGET profile=$CARGO_PROFILE"
+  (
+    cd "$WORKTREE"
+    python3 scripts/build_codex_package.py \
+      --target "$TARGET" \
+      --cargo-profile "$CARGO_PROFILE" \
+      --package-dir "$package_dir" \
+      --force \
+      --rg-bin "$rg_bin" \
+      --bwrap-bin "$bwrap_bin"
+  )
+  ln -sfn bin/codex "$package_dir/codex"
+  "$package_dir/codex" --version | grep -F "$version" >/dev/null \
+    || die "built package did not report expected version $version"
+}
+
+stop_updater_loop() {
+  local pattern="$CURRENT_LINK/codex app-server daemon pid-update-loop"
+  local pids
+  pids="$(pgrep -u "$(id -u)" -f "$pattern" || true)"
+  if [[ -n "$pids" ]]; then
+    log "stopping Codex standalone updater loop: $pids"
+    # shellcheck disable=SC2086
+    kill $pids || true
+  fi
+}
+
+wait_control_socket() {
+  for _ in $(seq 1 80); do
+    if [[ -S "$CONTROL_SOCKET" ]]; then
+      return
+    fi
+    sleep 0.25
+  done
+  die "remote-control socket did not appear at $CONTROL_SOCKET"
+}
+
+restart_remote_control_with_package() {
+  local package_dir="$1"
+  local version="$2"
+  local root
+  root="$(dirname "$CURRENT_LINK")"
+
+  systemctl --user stop "$REMOTE_CONTROL_SERVICE" >/dev/null 2>&1 || true
+
+  if [[ -x "$CURRENT_LINK/codex" ]]; then
+    "$CURRENT_LINK/codex" remote-control stop --json || true
+  fi
+
+  ln -sfnT "$package_dir" "$root/current.next"
+  mv -Tf "$root/current.next" "$CURRENT_LINK"
+
+  systemctl --user daemon-reload
+  systemctl --user enable "$REMOTE_CONTROL_SERVICE" >/dev/null
+  systemctl --user restart "$REMOTE_CONTROL_SERVICE"
+  systemctl --user is-active --quiet "$REMOTE_CONTROL_SERVICE" \
+    || die "$REMOTE_CONTROL_SERVICE did not become active"
+  wait_control_socket
+  "$CURRENT_LINK/codex" --version | grep -F "$version" >/dev/null \
+    || die "current Codex did not report expected version $version"
+  stop_updater_loop
+}
+
+ensure_current_package_running() {
+  local package_dir="$1"
+  local version="$2"
+  local current_real
+  current_real="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+  if [[ "$current_real" != "$package_dir" ]]; then
+    log "current symlink drifted to ${current_real:-<missing>}; restoring $package_dir"
+    restart_remote_control_with_package "$package_dir" "$version"
+    return
+  fi
+
+  if ! systemctl --user is-active --quiet "$REMOTE_CONTROL_SERVICE" || [[ ! -S "$CONTROL_SOCKET" ]]; then
+    log "remote-control service is not active or socket is missing; restarting for $version"
+    restart_remote_control_with_package "$package_dir" "$version"
+    return
+  fi
+
+  stop_updater_loop
+  log "already installed: $version ($package_dir)"
+}
+
+main() {
+  require_file "$PATCH_FILE"
+  [[ -d "$REPO_SOURCE/.git" || -f "$REPO_SOURCE/.git" ]] || die "source repo is not a git repository: $REPO_SOURCE"
+  [[ -d "$RELEASES_DIR" ]] || die "standalone releases dir is missing: $RELEASES_DIR"
+
+  log "checking latest stable OpenAI Codex release"
+  local tag base_version commit
+  tag="$(latest_stable_tag)"
+  base_version="$(base_version_from_tag "$tag")"
+  fetch_release_metadata
+  commit="$(git -C "$REPO_SOURCE" rev-parse "$tag^{commit}")"
+
+  load_state
+  if [[ "$installed_tag" == "$tag" && -n "$installed_package" && -x "$installed_package/codex" && -n "$installed_version" ]]; then
+    ensure_current_package_running "$installed_package" "$installed_version"
+    return
+  fi
+
+  log "new release detected: $tag ($commit)"
+  checkout_release "$tag"
+
+  local mode version
+  if upstream_has_fix; then
+    mode="upstream-fixed"
+    version="$base_version"
+    log "upstream already contains ChatGPT remote originator fix"
+  else
+    mode="patched"
+    version="$base_version-patched-remote-originator"
+    log "upstream lacks fix; applying local patch"
+    (cd "$WORKTREE" && git apply "$PATCH_FILE")
+  fi
+
+  set_workspace_version "$version"
+  local package_dir="$RELEASES_DIR/${version}-${TARGET}"
+  build_package "$version" "$package_dir"
+  restart_remote_control_with_package "$package_dir" "$version"
+  write_state "$tag" "$commit" "$mode" "$version" "$package_dir"
+  log "installed $version from $tag in mode=$mode"
+}
+
+main "$@"
+

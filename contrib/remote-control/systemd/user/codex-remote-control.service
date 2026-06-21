@@ -1,0 +1,16 @@
+[Unit]
+Description=Codex app-server remote control
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=CODEX_HOME=%h/.codex
+WorkingDirectory=%h
+ExecStart=%h/.codex/packages/standalone/current/codex app-server --remote-control --listen unix://
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=default.target
+

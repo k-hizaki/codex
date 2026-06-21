@@ -1,0 +1,11 @@
+[Unit]
+Description=Auto-update local Codex with ChatGPT remote originator patch
+Documentation=https://github.com/k-hizaki/codex/tree/main/contrib/remote-control
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-remote-originator-autopatch
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

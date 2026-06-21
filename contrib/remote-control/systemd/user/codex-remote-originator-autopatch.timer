@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for new stable OpenAI Codex releases and keep local patch applied
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+Unit=codex-remote-originator-autopatch.service
+
+[Install]
+WantedBy=timers.target
+

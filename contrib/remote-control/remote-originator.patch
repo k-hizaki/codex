@@ -1,0 +1,62 @@
+diff --git a/codex-rs/app-server/src/request_processors/initialize_processor.rs b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+index cfdad27..a0852c3 100644
+--- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
++++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+@@ -13,7 +13,12 @@ use super::*;
+ use crate::message_processor::ConnectionSessionState;
+ use crate::message_processor::InitializedConnectionSessionState;
+ 
+-const NON_ORIGINATING_CLIENT_NAMES: &[&str] = &["codex_app_server_daemon", "codex-backend"];
++const NON_ORIGINATING_CLIENT_NAMES: &[&str] = &[
++    "codex_app_server_daemon",
++    "codex-backend",
++    "codex_chatgpt_android_remote",
++    "codex_chatgpt_ios_remote",
++];
+ 
+ #[derive(Clone)]
+ pub(crate) struct InitializeRequestProcessor {
+diff --git a/codex-rs/app-server/tests/suite/v2/initialize.rs b/codex-rs/app-server/tests/suite/v2/initialize.rs
+index 6fb7aa3..921df31 100644
+--- a/codex-rs/app-server/tests/suite/v2/initialize.rs
++++ b/codex-rs/app-server/tests/suite/v2/initialize.rs
+@@ -116,6 +116,38 @@ async fn initialize_codex_backend_does_not_override_originator() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn initialize_chatgpt_remote_clients_do_not_override_originator() -> Result<()> {
++    for client_name in ["codex_chatgpt_android_remote", "codex_chatgpt_ios_remote"] {
++        let responses = Vec::new();
++        let server = create_mock_responses_server_sequence_unchecked(responses).await;
++        let codex_home = TempDir::new()?;
++        create_config_toml(codex_home.path(), &server.uri(), "never")?;
++        let mut mcp = TestAppServer::new(codex_home.path()).await?;
++
++        let message = timeout(
++            DEFAULT_READ_TIMEOUT,
++            mcp.initialize_with_client_info(ClientInfo {
++                name: client_name.to_string(),
++                title: None,
++                version: "1.2026.160".to_string(),
++            }),
++        )
++        .await??;
++
++        let JSONRPCMessage::Response(response) = message else {
++            anyhow::bail!("expected initialize response, got {message:?}");
++        };
++        let InitializeResponse { user_agent, .. } = to_response::<InitializeResponse>(response)?;
++
++        assert!(
++            user_agent.starts_with("codex_cli_rs/"),
++            "{client_name} should not become the app-server originator; got {user_agent}"
++        );
++    }
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn initialize_respects_originator_override_env_var() -> Result<()> {
+     let responses = Vec::new();
+
